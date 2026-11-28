@@ -135,12 +135,16 @@ struct GraphicContext {
 
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
+	void               AdvanceFrame(uint32_t frame);
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept {
 		return memory_budget_ext_enabled || m_memory_override_enabled;
 	}
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	[[nodiscard]] uint64_t GetHostMemoryUsage() const;
+	[[nodiscard]] uint64_t GetHostMemoryBudget() const;
+	[[nodiscard]] bool     IsHostMemoryPressured() const;
 
 	struct HeapUsage {
 		uint64_t usage        = 0;

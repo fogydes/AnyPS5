@@ -4068,14 +4068,17 @@ void TextureCache::CollectAt(std::chrono::steady_clock::time_point now) {
 		}
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	const bool host_pressured = m_graphics.IsHostMemoryPressured();
+	if (m_total_used_memory < m_trigger_gc_memory && !host_pressured) {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) KYTY_REQUIRES(m_lock) {
 		const bool critical   = m_total_used_memory >= m_critical_gc_memory;
-		bool       pressured  = m_total_used_memory >= m_pressure_gc_memory;
+		bool       pressured  = m_total_used_memory >= m_pressure_gc_memory || host_pressured;
 		bool       aggressive = allow_aggressive && critical;
 		size_t     deletions  = aggressive ? 40 : pressured ? 20 : 10;
+		constexpr size_t GcMaxDownloads = 4;
+		size_t     downloads  = GcMaxDownloads;
 		const auto cutoff = critical  ? m_gc_history.Cutoff<GcCriticalAge>(tick)
 		                  : pressured ? m_gc_history.Cutoff<GcDownloadAge>(tick)
 		                              : m_gc_history.Cutoff<16>(tick);
@@ -4100,10 +4103,12 @@ void TextureCache::CollectAt(std::chrono::steady_clock::time_point now) {
 			    owner->info.extent.height <= 1024) {
 				continue;
 			}
-			if (owner->SafeToDownload() &&
-			    ((!pressured && !m_gc_history.OldEnough<GcDownloadAge>(tick, owner->lru_tick)) ||
-			     owner->info.HasStencil() || !DownloadImageMemory(id))) {
-				continue;
+			if (owner->SafeToDownload()) {
+				if (downloads == 0 || !m_gc_history.OldEnough<GcDownloadAge>(tick, owner->lru_tick) ||
+				    owner->info.HasStencil() || !DownloadImageMemory(id)) {
+					continue;
+				}
+				--downloads;
 			}
 			--deletions;
 			FreeImage(id);

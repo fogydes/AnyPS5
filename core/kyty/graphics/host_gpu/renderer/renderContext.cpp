@@ -1233,6 +1233,7 @@ void RenderContext::PrepareHackMarks() {
 
 void RenderContext::RunGarbageCollector() {
 	m_frame_number++;
+	m_graphics.AdvanceFrame(static_cast<uint32_t>(m_frame_number));
 	m_descriptor_heap.TrimCompletedPools();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;

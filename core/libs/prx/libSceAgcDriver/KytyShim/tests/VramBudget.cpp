@@ -117,6 +117,13 @@ const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, Bu
 	if (const auto* failure = CheckDescriptorPoolRetirement(graphics)) {
 		return failure;
 	}
+	graphics.AdvanceFrame(1);
+	if (graphics.IsHostMemoryPressured()) {
+		return "host memory pressure check ignored memory override";
+	}
+	if (graphics.spill_allocator != nullptr && graphics.GetHostMemoryBudget() == 0) {
+		return "discrete GPU spill allocator reported zero host memory budget";
+	}
 	const auto tex_trigger_large  = VramBudgetTestAccess::TextureTrigger(textures);
 	const auto tex_pressure_large = VramBudgetTestAccess::TexturePressure(textures);
 	const auto tex_critical_large = VramBudgetTestAccess::TextureCritical(textures);

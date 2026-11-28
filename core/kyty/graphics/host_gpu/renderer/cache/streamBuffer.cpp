@@ -134,10 +134,16 @@ void Buffer::Commit(uint64_t offset, uint64_t size) {
 		memory.alignment      = std::max(m_sparse_block, zero_requirements.alignment);
 		memory.memoryTypeBits = m_sparse_types & zero_requirements.memoryTypeBits;
 		VmaAllocationCreateInfo alloc_info {};
+		alloc_info.flags         = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
 		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 		VmaAllocationInfo allocated {};
-		const auto        result =
+		auto              result =
 		    vmaAllocateMemory(graphics.allocator, &memory, &alloc_info, &m_sparse_blocks[block], &allocated);
+		if (result != VK_SUCCESS) {
+			alloc_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+			result = vmaAllocateMemory(graphics.allocator, &memory, &alloc_info, &m_sparse_blocks[block],
+			                           &allocated);
+		}
 		if (result != VK_SUCCESS) {
 			std::array<GraphicContext::HeapUsage, VK_MAX_MEMORY_HEAPS> heaps {};
 			const auto heap_count = graphics.GetHeapUsage(heaps);
@@ -259,9 +265,36 @@ void Buffer::Create(vk::BufferUsageFlags flags) {
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
+	VmaAllocator      used_allocator = graphics.allocator;
 	auto              result        = static_cast<vk::Result>(vmaCreateBuffer(
 	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
 	    &native_buffer, &m_allocation, &allocation_result));
+	if (result == vk::Result::eErrorOutOfDeviceMemory &&
+	    (usage == MemoryUsage::DeviceLocal || usage == MemoryUsage::Stream) &&
+	    graphics.spill_allocator != nullptr) {
+		uint32_t non_device_local_types = 0;
+		for (uint32_t type = 0; type < graphics.physical_device_memory_properties.memoryTypeCount; ++type) {
+			const auto heap = graphics.physical_device_memory_properties.memoryTypes[type].heapIndex;
+			if (!(graphics.physical_device_memory_properties.memoryHeaps[heap].flags &
+			      vk::MemoryHeapFlagBits::eDeviceLocal)) {
+				non_device_local_types |= uint32_t {1} << type;
+			}
+		}
+		if (non_device_local_types != 0) {
+			VmaAllocationCreateInfo spill_info = allocation_info;
+			spill_info.flags                   = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
+			spill_info.usage                   = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			spill_info.memoryTypeBits          = non_device_local_types;
+			spill_info.preferredFlags          = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+			result = static_cast<vk::Result>(vmaCreateBuffer(
+			    graphics.spill_allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &spill_info,
+			    &native_buffer, &m_allocation, &allocation_result));
+			if (result == vk::Result::eSuccess) {
+				used_allocator = graphics.spill_allocator;
+				LOGF("Buffer allocation past the heap limit placed by the spill allocator: size=%" PRIu64 "\n", size);
+			}
+		}
+	}
 	if (result == vk::Result::eErrorOutOfDeviceMemory) {
 		LOGF("Buffer allocation ran out of device memory with budget enforcement: size=%" PRIu64
 		     ", memory_usage=%u; retrying without the budget limit\n",
@@ -272,7 +305,7 @@ void Buffer::Create(vk::BufferUsageFlags flags) {
 		    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
 		                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
 	}
-	m_allocator = graphics.allocator;
+	m_allocator = used_allocator;
 	if (result != vk::Result::eSuccess && graphics.spill_allocator != nullptr) {
 		VmaAllocationCreateInfo spill_info = allocation_info;
 		spill_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;

@@ -247,11 +247,21 @@ void GraphicContext::DestroyAllocator() {
 		return;
 	}
 	DestroyRecycledImages(allocator);
+	Graveyard().Flush();
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 	if (spill_allocator != nullptr) {
 		vmaDestroyAllocator(spill_allocator);
 		spill_allocator = nullptr;
+	}
+}
+
+void GraphicContext::AdvanceFrame(uint32_t frame) {
+	if (allocator != nullptr) {
+		vmaSetCurrentFrameIndex(allocator, frame);
+	}
+	if (spill_allocator != nullptr) {
+		vmaSetCurrentFrameIndex(spill_allocator, frame);
 	}
 }
 
@@ -270,6 +280,17 @@ void GraphicContext::LogMemoryBudget() const {
 		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
 		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
 	}
+	if (spill_allocator != nullptr) {
+		vmaGetHeapBudgets(spill_allocator, budgets);
+		for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
+			LOGF("VMA spill heap %u: usage=%" PRIu64 ", budget=%" PRIu64 ", allocation=%" PRIu64
+			     ", blocks=%" PRIu64 "\n",
+			     i, static_cast<uint64_t>(budgets[i].usage),
+			     static_cast<uint64_t>(budgets[i].budget),
+			     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
+			     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
+		}
+	}
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
@@ -280,7 +301,7 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 		return 0;
 	}
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
-	vmaGetHeapBudgets(allocator, budgets);
+	vmaGetHeapBudgets(spill_allocator != nullptr ? spill_allocator : allocator, budgets);
 	const bool discrete =
 	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
 	uint64_t usage = 0;
@@ -300,7 +321,7 @@ uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> 
 		return 0;
 	}
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
-	vmaGetHeapBudgets(allocator, budgets);
+	vmaGetHeapBudgets(spill_allocator != nullptr ? spill_allocator : allocator, budgets);
 	const auto count = physical_device_memory_properties.memoryHeapCount;
 	for (uint32_t heap = 0; heap < count; heap++) {
 		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
@@ -321,12 +342,15 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 		return 0;
 	}
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
-	vmaGetHeapBudgets(allocator, budgets);
+	vmaGetHeapBudgets(spill_allocator != nullptr ? spill_allocator : allocator, budgets);
+	const VkPhysicalDeviceMemoryProperties* limited = nullptr;
+	vmaGetMemoryProperties(allocator, &limited);
 	const bool discrete =
 	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
-	uint64_t budget = 0;
-	uint64_t local  = 0;
-	uint64_t usage  = 0;
+	uint64_t budget        = 0;
+	uint64_t local         = 0;
+	uint64_t usage         = 0;
+	bool     limit_applied = false;
 	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
 		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
 		const bool  device_local =
@@ -335,12 +359,19 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 			local += properties.size;
 		}
 		if (!discrete || device_local) {
-			budget += CanReportMemoryUsage() ? budgets[heap].budget : properties.size;
+			const uint64_t reported = CanReportMemoryUsage() ? budgets[heap].budget : properties.size;
+			const uint64_t capped =
+			    limited != nullptr && heap < limited->memoryHeapCount && limited->memoryHeaps[heap].size < properties.size
+			        ? (limit_applied = true, std::min<uint64_t>(reported, limited->memoryHeaps[heap].size))
+			        : reported;
+			budget += capped;
 			usage += CanReportMemoryUsage() ? budgets[heap].usage : 0;
 		}
 	}
 	if (discrete) {
-		return std::min(budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024), MemoryBudgetCap());
+		const uint64_t adjusted =
+		    limit_applied ? budget : budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
+		return std::min(adjusted, MemoryBudgetCap());
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
 	const auto         available      = budget > usage ? budget - usage : uint64_t {0};
@@ -348,8 +379,76 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	                MemoryBudgetCap());
 }
 
+uint64_t GraphicContext::GetHostMemoryUsage() const {
+	if (allocator == nullptr ||
+	    physical_device_properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	VmaBudget spill_budgets[VK_MAX_MEMORY_HEAPS] {};
+	if (spill_allocator != nullptr) {
+		vmaGetHeapBudgets(spill_allocator, spill_budgets);
+	}
+	uint64_t usage = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const bool device_local =
+		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
+		                      vk::MemoryHeapFlagBits::eDeviceLocal);
+		if (device_local) {
+			continue;
+		}
+		usage += budgets[heap].usage;
+		if (!memory_budget_ext_enabled && spill_allocator != nullptr) {
+			usage += spill_budgets[heap].usage;
+		}
+	}
+	return usage;
+}
+
+uint64_t GraphicContext::GetHostMemoryBudget() const {
+	if (allocator == nullptr ||
+	    physical_device_properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(spill_allocator != nullptr ? spill_allocator : allocator, budgets);
+	uint64_t budget = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
+		if (!(properties.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+			budget += CanReportMemoryUsage() ? budgets[heap].budget : properties.size;
+		}
+	}
+	return budget;
+}
+
+bool GraphicContext::IsHostMemoryPressured() const {
+	if (m_memory_override_enabled) {
+		return false;
+	}
+	const uint64_t budget = GetHostMemoryBudget();
+	if (budget == 0) {
+		return false;
+	}
+	const uint64_t usage = GetHostMemoryUsage();
+	return usage >= (budget / 4) * 3 || (usage <= budget && budget - usage < (1ull << 30));
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	return CreateImage(image_info, image, false);
+}
+
+static uint32_t NonDeviceLocalMemoryTypes(const GraphicContext& graphics) {
+	const auto& physical = graphics.physical_device_memory_properties;
+	uint32_t    types    = 0;
+	for (uint32_t type = 0; type < physical.memoryTypeCount; ++type) {
+		const auto heap = physical.memoryTypes[type].heapIndex;
+		if (!(physical.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+			types |= uint32_t {1} << type;
+		}
+	}
+	return types;
 }
 
 static uint32_t BindlessImageSpillTypes(const GraphicContext& graphics) {
@@ -373,20 +472,14 @@ static uint32_t BindlessImageSpillTypes(const GraphicContext& graphics) {
 	if (!pressure) {
 		return 0;
 	}
-	uint32_t types = 0;
-	for (uint32_t type = 0; type < limited->memoryTypeCount; ++type) {
-		const auto heap = limited->memoryTypes[type].heapIndex;
-		if (!(limited->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) {
-			types |= uint32_t {1} << type;
-		}
-	}
-	return types;
+	return NonDeviceLocalMemoryTypes(graphics);
 }
 
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image,
                                  bool bindless) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
+	image.spilled = false;
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
@@ -408,13 +501,13 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	}
 	if (native_image == VK_NULL_HANDLE) {
 		const auto* create = static_cast<const vk::ImageCreateInfo::NativeType*>(image_info);
-		auto result = vk::Result::eErrorOutOfDeviceMemory;
+		auto        result = vk::Result::eErrorOutOfDeviceMemory;
 		if (const uint32_t types = bindless ? BindlessImageSpillTypes(*this) : 0; types != 0) {
 			VmaAllocationCreateInfo spill_info {};
 			spill_info.flags          = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
 			spill_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 			spill_info.memoryTypeBits = types;
-			result = static_cast<vk::Result>(vmaCreateImage(
+			result                    = static_cast<vk::Result>(vmaCreateImage(
 			    spill_allocator, create, &spill_info, &native_image, &image.allocation, nullptr));
 			image.spilled = result == vk::Result::eSuccess;
 		}
@@ -428,25 +521,25 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			    allocator, create, &alloc_info, &native_image, &image.allocation, nullptr));
 		}
 		if (result != vk::Result::eSuccess && spill_allocator != nullptr) {
+			const uint32_t          non_device_local_types = NonDeviceLocalMemoryTypes(*this);
 			VmaAllocationCreateInfo spill_info {};
-			spill_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-			result           = static_cast<vk::Result>(vmaCreateImage(
+			spill_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			spill_info.memoryTypeBits = non_device_local_types;
+			result                    = static_cast<vk::Result>(vmaCreateImage(
 			    spill_allocator, create, &spill_info, &native_image, &image.allocation, nullptr));
-			if (result == vk::Result::eSuccess) {
-				image.spilled = true;
-				static std::atomic<uint32_t> reported {0};
-				if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
-					LOGF("Vulkan memory: an image of %ux%u past the heap limit is placed by the spill allocator\n",
-					     image_info.extent.width, image_info.extent.height);
+			if (non_device_local_types == 0 || result == vk::Result::eErrorFeatureNotPresent) {
+				if (result == vk::Result::eErrorFeatureNotPresent) {
+					static std::atomic<uint32_t> optimal_fallback_reported {0};
+					if (optimal_fallback_reported.fetch_add(1, std::memory_order_relaxed) < 4) {
+						LOGF("Vulkan memory: optimal image %ux%u cannot use host memory; spilling without "
+						     "type filter\n",
+						     image_info.extent.width, image_info.extent.height);
+					}
 				}
+				spill_info.memoryTypeBits = 0;
+				result                    = static_cast<vk::Result>(vmaCreateImage(
+				    spill_allocator, create, &spill_info, &native_image, &image.allocation, nullptr));
 			}
-		}
-		if (result != vk::Result::eSuccess && spill_allocator != nullptr) {
-			VmaAllocationCreateInfo spill_info {};
-			spill_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-			result           = static_cast<vk::Result>(vmaCreateImage(
-                spill_allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &spill_info,
-                &native_image, &image.allocation, nullptr));
 			if (result == vk::Result::eSuccess) {
 				image.spilled = true;
 				static std::atomic<uint32_t> reported {0};

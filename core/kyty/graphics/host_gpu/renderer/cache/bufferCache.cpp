@@ -3355,11 +3355,12 @@ void BufferCache::CollectAt(std::chrono::steady_clock::time_point now) {
 		}
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	const bool host_pressured = m_graphics.IsHostMemoryPressured();
+	if (m_total_used_memory < m_trigger_gc_memory && !host_pressured) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory || host_pressured;
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	const auto cutoff = aggressive ? m_gc_history.Cutoff<80>(tick) : m_gc_history.Cutoff<160>(tick);
