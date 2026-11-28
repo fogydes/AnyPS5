@@ -132,6 +132,8 @@ private:
 		size_t                  dirty_begin = 0;
 		size_t                  dirty_end   = 0;
 		size_t                  order       = 0;
+		uint64_t                draw        = 0;
+		uint32_t                idle        = 0;
 	};
 
 	[[nodiscard]] bool Refresh(Memory& memory);

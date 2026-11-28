@@ -308,6 +308,8 @@ bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& re
 	}
 	auto& held = m_lists[key];
 	held.view = &view;
+	held.draw = m_draw;
+	held.idle = 0;
 	for (auto slot = slots - 1u; slot < held.slots.size(); ++slot) Assign(held, slot, 0u);
 	const auto previous = held.slots.size();
 	held.slots.resize(slots, 0u);
@@ -975,6 +977,28 @@ void ImageHeap::RunGarbageCollector() {
 		Drop(*memory);
 		return true;
 	});
+	auto& scheduler = m_context.GetCommandScheduler();
+	bool  retire    = false;
+	std::erase_if(m_lists, [&](std::pair<const ListKey, List>& entry) {
+		auto& list = entry.second;
+		list.idle  = list.draw > m_suspend_draw ? 0u : list.idle + 1u;
+		if (list.idle < LargeTableIdleFrames) {
+			return false;
+		}
+		std::erase(m_active_lists, &list);
+		for (size_t slot = 0; slot < list.slots.size(); ++slot) {
+			Unlink(list, slot, list.slots[slot]);
+			Release(list.slots[slot]);
+		}
+		if (list.buffer != nullptr && scheduler.Active()) {
+			scheduler.DeferOperation([buffer = std::move(list.buffer)] {});
+		}
+		retire = true;
+		return true;
+	});
+	if (retire) {
+		Retire();
+	}
 	m_suspend_draw = m_draw;
 }
 
