@@ -1973,7 +1973,7 @@ static std::size_t ResidentRoom(std::size_t bytes, std::size_t pageBytes) {
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
     if (GlobalMemoryStatusEx(&status) == 0) return 0;
-    const std::uint64_t reserve = status.ullTotalPhys / 16;
+    const std::uint64_t reserve = std::max<std::uint64_t>(status.ullTotalPhys / 4, std::uint64_t{2} << 30);
     const std::uint64_t room = status.ullAvailPhys > reserve ? (status.ullAvailPhys - reserve) / pageBytes * pageBytes : 0;
     return static_cast<std::size_t>(std::min<std::uint64_t>(bytes, room));
 }
@@ -1995,7 +1995,7 @@ static void PopulateDirectMapping(std::uintptr_t address, std::size_t mappedByte
     const std::size_t bytes = ResidentRoom(mappedBytes, pageBytes);
     if (bytes < mappedBytes) {
         static std::once_flag noted;
-        std::call_once(noted, [bytes, mappedBytes] { std::fprintf(stderr, "[memory] direct memory: %zu MiB of a %zu MiB mapping populated, so a sixteenth of host memory stays available; the rest, and what later mappings do not fit, stays paged on demand\n", bytes >> 20, mappedBytes >> 20); });
+        std::call_once(noted, [bytes, mappedBytes] { std::fprintf(stderr, "[memory] direct memory: %zu MiB of a %zu MiB mapping populated, so at least a quarter of host memory stays available; the rest, and what later mappings do not fit, stays paged on demand\n", bytes >> 20, mappedBytes >> 20); });
     }
     if (bytes == 0) return;
     constexpr std::size_t chunkBytes = std::size_t{256} << 20;
